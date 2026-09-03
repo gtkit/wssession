@@ -1,0 +1,7 @@
+.idea/
+.vscode/
+.DS_Store
+__MACOSX/
+.Ds_Store
+*.log
+coverage.out
