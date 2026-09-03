@@ -6,6 +6,20 @@
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [1.1.0] - 2026-09-03
+
+### Added
+
 - 新增 `ErrConnCapExceeded` 哨兵：连接被 IP 或 token 维度连接 cap 拒绝时，`Serve` 返回包装了它的错误，可用 `errors.Is` 判断
 
 ### Changed
@@ -15,10 +29,6 @@
 - 握手阶段默认设置 10s `HandshakeTimeout`（此前无超时），仍可经 `Options.ConfigureUpgrader` 覆盖
 - `Serve` 对 Upgrade 失败的错误加 `wssession: upgrade:` 前缀包装，`errors.Is` / `errors.As` 仍可穿透到 gorilla 原始错误
 - `sessionhub.Registry.Users` 在没有活跃连接时返回 nil（此前为空切片），与 `List` / `Conns` 的空值约定一致
-
-### Deprecated
-
-### Removed
 
 ### Fixed
 
