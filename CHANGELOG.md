@@ -8,8 +8,6 @@
 
 ### Changed
 
-- 最低 Go 版本升至 1.27（`github.com/gtkit/json/v2` v2.1.1 要求 `go 1.27`），下游工具链需 ≥ 1.27
-
 ### Deprecated
 
 ### Removed
@@ -17,6 +15,12 @@
 ### Fixed
 
 ### Security
+
+## [1.2.0] - 2026-09-03
+
+### Changed
+
+- 最低 Go 版本升至 1.27（`github.com/gtkit/json/v2` v2.1.1 要求 `go 1.27`），下游工具链需 ≥ 1.27
 
 ## [1.1.0] - 2026-09-03
 
