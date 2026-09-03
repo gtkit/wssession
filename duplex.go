@@ -25,7 +25,7 @@ type inboundGate struct {
 	notified bool
 }
 
-// duplexLoop 是双向模式的消息调度循环(详见 design.md D-3/D-4、D-8)。
+// duplexLoop 是双向模式的消息调度循环。
 //
 // 职责:
 //   - 首帧已被 ParseRequest 当订阅/鉴权帧消费;本循环处理其后的每条消息,
@@ -66,7 +66,9 @@ func (s *Session) startBackgroundRun(ctx context.Context, cancel context.CancelF
 	wg.Go(func() {
 		defer func() {
 			if p := recover(); p != nil {
-				s.options.emit(ctx, Event{Type: EventPanic, Reason: "panic in background Run", Err: fmt.Errorf("%v", p)})
+				panicErr := fmt.Errorf("wssession: panic in background Run: %v", p)
+				s.options.emit(ctx, Event{Type: EventPanic, Reason: "panic in background Run", Err: panicErr})
+				s.closeWithError(ctx, CodeInternal, ReasonInternalError, panicErr)
 				cancel()
 			}
 		}()
@@ -122,7 +124,8 @@ func (s *Session) dispatchInterrupt(ctx context.Context, cancel context.CancelFu
 				s.options.emit(ctx, Event{Type: EventTurnInterrupted, Reason: "interrupted by new message"})
 				if !s.waitTurnDone(ctx, active, "turn stuck after interrupt") {
 					stuckHandled = true
-					s.closeWithError(ctx, CodeInternal, ReasonInternalError)
+					// cause 为 nil:失约已由 EventTurnStuck 上报,不再作为 Serve 错误。
+					s.closeWithError(ctx, CodeInternal, ReasonInternalError, nil)
 					cancel()
 					return errTurnStuck
 				}
@@ -234,12 +237,13 @@ func (s *Session) startTurn(ctx context.Context, cancel context.CancelFunc, wg *
 // runTurn 执行一轮消息回调,并把返回值与 panic 映射到连接级处置。
 //
 // 三种调度模式共用:打断式 / 并发式在各自的 goroutine 内调用,顺序式内联调用——
-// 处置后果一致(业务错误与 panic 都收敛整条连接)。
+// 处置后果一致(业务错误与 panic 都收敛整条连接,并作为根因记入 termErr 由 Serve 返回)。
 func (s *Session) runTurn(turnCtx context.Context, cancel context.CancelFunc, frame inboundFrame, sink PushSink) {
 	defer func() {
 		if p := recover(); p != nil {
-			s.options.emit(turnCtx, Event{Type: EventPanic, Reason: "panic in message handler", Err: fmt.Errorf("%v", p)})
-			s.closeWithError(turnCtx, CodeInternal, ReasonInternalError)
+			panicErr := fmt.Errorf("wssession: panic in message handler: %v", p)
+			s.options.emit(turnCtx, Event{Type: EventPanic, Reason: "panic in message handler", Err: panicErr})
+			s.closeWithError(turnCtx, CodeInternal, ReasonInternalError, panicErr)
 			cancel()
 		}
 	}()
@@ -255,10 +259,10 @@ func (s *Session) runTurn(turnCtx context.Context, cancel context.CancelFunc, fr
 		// 业务自身 ctx 取消:预期,静默
 	case errors.Is(err, ErrSlowConsumer):
 		s.options.emit(turnCtx, Event{Type: EventSlowConsumer, Reason: ReasonSlowConsumer, Err: err})
-		s.closeWithError(turnCtx, CodeTooManyConn, ReasonSlowConsumer)
+		s.closeWithError(turnCtx, CodeTooManyConn, ReasonSlowConsumer, err)
 		cancel() // 慢消费者 → 收敛整连接
 	default:
-		s.closeWithError(turnCtx, CodeInternal, ReasonInternalError)
+		s.closeWithError(turnCtx, CodeInternal, ReasonInternalError, err)
 		cancel() // 业务错误 → 收敛整连接
 	}
 }

@@ -6,7 +6,15 @@
 
 ### Added
 
+- 新增 `ErrConnCapExceeded` 哨兵：连接被 IP 或 token 维度连接 cap 拒绝时，`Serve` 返回包装了它的错误，可用 `errors.Is` 判断
+
 ### Changed
+
+- `Serve` 的返回值改为确定性：服务端主动错误关闭的根因（首帧超时 `ErrFirstFrameTimeout`、`ParseRequest` 错误、token cap、`Run` / `OnMessage` / `OnBinaryMessage` 返回的非预期错误或 panic、帧准入拒绝）一律从 `Serve` 返回。此前单向模式下它与读循环因主动关闭而返回的预期 close 错误竞争，偶发返回 nil；双向模式下消息回调的业务错误与后台 `Run` 的 panic 从不返回，服务端侧没有任何信号；首帧超时此前实际返回 nil
+- 后台 `Run`（双向模式）发生 panic 时，现在与消息回调 panic 一致：下发 `error(500)` 帧并完成 close 握手，此前只静默收敛连接
+- 握手阶段默认设置 10s `HandshakeTimeout`（此前无超时），仍可经 `Options.ConfigureUpgrader` 覆盖
+- `Serve` 对 Upgrade 失败的错误加 `wssession: upgrade:` 前缀包装，`errors.Is` / `errors.As` 仍可穿透到 gorilla 原始错误
+- `sessionhub.Registry.Users` 在没有活跃连接时返回 nil（此前为空切片），与 `List` / `Conns` 的空值约定一致
 
 ### Deprecated
 
@@ -14,7 +22,12 @@
 
 ### Fixed
 
+- `Push` / `TryPush` 传入 `*Frame` 指针时不再被当作普通 payload 序列化成 `{}`，而是与 `Frame` 同样原样入队；nil `*Frame` 返回 `ErrInvalidFrame`
+- error 帧与 `EventClientClose` 的 reason 按 256 字节截断时回退到 UTF-8 字符边界，不再把多字节字符切成非法字节
+
 ### Security
+
+- `TrustedProxyCount` 大于 `X-Forwarded-For` 条目数时（请求没有经过完整的可信链）改为退回 `RemoteAddr`，此前会取客户端可控的最左端条目，使 IP 维度连接 cap 可被伪造的 XFF 绕过
 
 ## [1.0.0] - 2026-09-03
 

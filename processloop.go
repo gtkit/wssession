@@ -9,7 +9,7 @@ import (
 
 // processLoop 是首帧编排 + Run 调度。
 //
-// 流程(详见 docs/wsmsg-flow.md §1 主路径):
+// 流程:
 //
 //	① 启动 firstFrameTimer
 //	② 等 inbox 首帧(超时 / 收到帧 / ctx done 三选一)
@@ -37,7 +37,7 @@ func (s *Session) processLoop(ctx context.Context, cancel context.CancelFunc) (e
 	// 与下面"首帧到达"路径用同一个 firstFrameClaimed CAS 互斥,避免竞态。
 	firstFrameTimer := time.AfterFunc(s.options.FirstFrameTimeout, func() {
 		if s.firstFrameClaimed.CompareAndSwap(false, true) {
-			s.closeWithError(ctx, CodeFirstFrameTimeout, ReasonFirstFrameTimeout)
+			s.closeWithError(ctx, CodeFirstFrameTimeout, ReasonFirstFrameTimeout, ErrFirstFrameTimeout)
 		}
 	})
 
@@ -58,7 +58,7 @@ func (s *Session) processLoop(ctx context.Context, cancel context.CancelFunc) (e
 	// ③ Handlers.ParseRequest
 	key, req, parseErr := s.handlers.ParseRequest(ctx, firstFrame.raw)
 	if parseErr != nil {
-		s.closeWithError(ctx, CodeInvalidParam, parseErr.Error())
+		s.closeWithError(ctx, CodeInvalidParam, parseErr.Error(), parseErr)
 		return parseErr
 	}
 	// 存下业务请求对象,供 Session.Value() 跨 goroutine 读取(双向模式各轮回调)。
@@ -69,9 +69,10 @@ func (s *Session) processLoop(ctx context.Context, cancel context.CancelFunc) (e
 		tokenCapKey := "token:" + key + ":" + s.path
 		_, ok := tryAcquire(tokenCapKey, s.options.ConnCapKeyMax)
 		if !ok {
+			capErr := fmt.Errorf("%w: token dimension", ErrConnCapExceeded)
 			s.options.emit(ctx, Event{Type: EventCapRejected, Reason: ReasonTooManyTokenConn, Key: tokenCapKey})
-			s.closeWithError(ctx, CodeTooManyConn, ReasonTooManyTokenConn)
-			return errors.New("wssession: token connCap exceeded")
+			s.closeWithError(ctx, CodeTooManyConn, ReasonTooManyTokenConn, capErr)
+			return capErr
 		}
 		// 释放挂在 Serve 退出路径(见 Session.tokenCapKey):cap 占用覆盖整条
 		// 连接的生命周期,不随 processLoop 提前退出而提前释放。
@@ -115,7 +116,7 @@ func (s *Session) dispatchRunError(ctx context.Context, runErr error) error {
 		return nil
 	case errors.Is(runErr, ErrSlowConsumer):
 		s.options.emit(ctx, Event{Type: EventSlowConsumer, Reason: ReasonSlowConsumer, Err: runErr})
-		s.closeWithError(ctx, CodeTooManyConn, ReasonSlowConsumer)
+		s.closeWithError(ctx, CodeTooManyConn, ReasonSlowConsumer, runErr)
 		return runErr
 	case errors.Is(runErr, context.Canceled), errors.Is(runErr, context.DeadlineExceeded):
 		// ctx 取消是预期路径(客户端断 / 30 分钟超时 / turn 被打断),不下发 error 帧
@@ -123,7 +124,7 @@ func (s *Session) dispatchRunError(ctx context.Context, runErr error) error {
 	default:
 		// 未预期的业务错误统一按内部错误处理,客户端只收到稳定 reason。
 		// 错误通过 Serve 返回值上抛给调用方,由调用方决定是否记录日志。
-		s.closeWithError(ctx, CodeInternal, ReasonInternalError)
+		s.closeWithError(ctx, CodeInternal, ReasonInternalError, runErr)
 		return runErr
 	}
 }

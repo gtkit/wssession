@@ -29,18 +29,7 @@ func (s *Session) writeLoop(ctx context.Context, cancel context.CancelFunc) (err
 	// 退出时 drain outbox:滞留帧不再写出,但兑现其 done 信号,
 	// 让 closeWithError / closeNormal 的等待方立即解除阻塞而非等满 1s 兜底。
 	// drain 之后才入队的帧由等待方的兜底超时覆盖。
-	defer func() {
-		for {
-			select {
-			case msg := <-s.outbox:
-				if msg.done != nil {
-					close(msg.done)
-				}
-			default:
-				return
-			}
-		}
-	}()
+	defer s.drainOutbox()
 
 	pingTicker := time.NewTicker(s.options.PingInterval)
 	defer pingTicker.Stop()
@@ -75,4 +64,18 @@ func (s *Session) writeOutbound(msg outboundMessage) error {
 	}
 	// data 已是序列化字节,writeLoop 只做纯 IO。
 	return s.wsConn.WriteMessage(msg.messageType, msg.data)
+}
+
+// drainOutbox 非阻塞地取空 outbox,对每个滞留帧兑现 done 信号(帧本身不再写出)。
+func (s *Session) drainOutbox() {
+	for {
+		select {
+		case msg := <-s.outbox:
+			if msg.done != nil {
+				close(msg.done)
+			}
+		default:
+			return
+		}
+	}
 }

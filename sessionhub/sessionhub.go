@@ -18,6 +18,8 @@ package sessionhub
 
 import (
 	"context"
+	"maps"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -161,15 +163,12 @@ func (r *Registry) Count(userID string) int {
 	return len(r.byUser[userID])
 }
 
-// Users 返回当前有活跃连接的所有 userID(顺序不确定)。
+// Users 返回当前有活跃连接的所有 userID(顺序不确定);没有活跃连接时返回 nil,
+// 与 List / Conns 的空值约定一致。
 func (r *Registry) Users() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := make([]string, 0, len(r.byUser))
-	for uid := range r.byUser {
-		out = append(out, uid)
-	}
-	return out
+	return slices.Collect(maps.Keys(r.byUser))
 }
 
 // Total 返回全局活跃连接总数。

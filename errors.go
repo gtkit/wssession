@@ -9,7 +9,7 @@ var (
 	ErrSlowConsumer = errors.New("wssession: slow consumer (outbox queue full)")
 
 	// ErrFirstFrameTimeout Upgrade 后 Options.FirstFrameTimeout 内无任何 inbound 帧。
-	// 由 processLoop 在 timer 触发时主动 close。
+	// 客户端收到 error(408) + close 1008,Serve 返回本错误。
 	ErrFirstFrameTimeout = errors.New("wssession: first frame timeout")
 
 	// ErrInvalidFrame 帧不被接受:入站侧为帧类型不被当前 Handlers 接受
@@ -30,19 +30,28 @@ var (
 	// ErrDeadlineNotExtendable 在未开启 Options.SessionDeadlineExtendable 的连接上
 	// 调用了 Session.ExtendDeadline。会话截止时间不变。
 	ErrDeadlineNotExtendable = errors.New("wssession: session deadline is not extendable, set Options.SessionDeadlineExtendable")
+
+	// ErrConnCapExceeded 连接被 IP 或 token 维度的连接 cap 拒绝。Serve 返回包装了本哨兵
+	// 的错误(errors.Is 可判),维度在错误文案中;cap key 见同时上报的 EventCapRejected.Key。
+	ErrConnCapExceeded = errors.New("wssession: connection cap exceeded")
 )
 
-// 错误码常量 — 与 docs/wsmsg-flow.md §5 错误码映射表对齐。
+// 下发给客户端 error 帧的业务错误码(对外契约)。WS close code 映射:500 → 1011,其余 → 1008。
 const (
+	// CodeFirstFrameTimeout Upgrade 后 Options.FirstFrameTimeout 内未收到首帧。
 	CodeFirstFrameTimeout = 408
 	// CodeConflict 会话冲突:连接被同一身份的新会话顶下线(Session.Kick 下发)。
 	// 客户端收到 error(409) 应提示"已在其他设备登录"且**不**自动重连
 	// (与 close 1001 的"应重连"语义相反);WS 层 close code 映射为 1008。
-	CodeConflict         = 409
+	CodeConflict = 409
+	// CodeInvalidFrameType 帧类型不被接受:未提供 OnBinaryMessage 时收到二进制帧,或首帧不是文本帧。
 	CodeInvalidFrameType = 415
-	CodeInvalidParam     = 422
-	CodeTooManyConn      = 429
-	CodeInternal         = 500
+	// CodeInvalidParam 首帧解析失败(ParseRequest 返回 error),或订阅后收到不被接受的文本帧(协议违规)。
+	CodeInvalidParam = 422
+	// CodeTooManyConn token 维度连接 cap 已满、慢消费者,或双向模式入站限速提示(限速提示不关连接)。
+	CodeTooManyConn = 429
+	// CodeInternal 业务回调返回未分类错误或发生 panic;客户端只收到稳定的 ReasonInternalError 文案。
+	CodeInternal = 500
 )
 
 const maxErrorReasonLen = 256

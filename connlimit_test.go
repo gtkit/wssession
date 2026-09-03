@@ -89,13 +89,11 @@ func TestTryAcquire_ConcurrentEnterLeaveBalances(t *testing.T) {
 	var wg sync.WaitGroup
 
 	for range N {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if _, ok := tryAcquire(key, 100); ok {
 				release(key)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 

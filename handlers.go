@@ -5,7 +5,7 @@ import "context"
 // Handlers 由业务侧注入,wssession 通过这些函数完成"协议无关 + 业务无关"。
 //
 // 设计原则:
-//   - 函数式注入而非 interface,业务侧写匿名函数即可,不需要新建 type(详见 design.md D-2)
+//   - 函数式注入而非 interface,业务侧写匿名函数即可,不需要新建 type
 //   - ParseRequest 必填;Run / OnMessage / OnBinaryMessage 三者至少一个;OnConnect 可选
 //   - ParseRequest 必须**快**(只做 JSON 解析 + 字段校验,不调 DB / 网络);
 //     若需要重操作放到 Run 内,因为 Run 跑在独立的 processLoop 串行段不阻塞 readLoop
@@ -18,8 +18,7 @@ import "context"
 type Handlers struct {
 	// OnConnect 可选,Upgrade 成功 + 进 lifecycle goroutine 之前调一次。
 	//
-	// 适用场景:连接级 setup(连接 ID 注册 / 准入审计日志 / 自定义心跳计数器);
-	// 当前订单业务不使用此 hook。
+	// 适用场景:连接级 setup(连接 ID 注册 / 准入审计日志 / 自定义心跳计数器)。
 	//
 	// 返回 error 时 Session 立即 close,不下发任何业务帧。
 	OnConnect func(ctx context.Context, sess *Session) error
@@ -27,7 +26,9 @@ type Handlers struct {
 	// ParseRequest 解析客户端首帧,返回:
 	//   - key:用于 token 维度 connCap 计数的 key(空字符串 → 跳过 tokenCap,继续 Run)
 	//   - req:业务请求对象,会原样传给 Run(无类型约束,业务自定义)
-	//   - err:解析失败 → 桥接层下发 error 帧(code=422)+ close
+	//   - err:解析失败 → 桥接层下发 error 帧(code=422)+ close。**err.Error() 会作为
+	//     该帧的 reason 原样下发给客户端**(按 256 字节截断),只返回适合客户端看到的
+	//     文案,不要把内部错误包装进去;同一个 err 也会作为根因从 Serve 返回
 	//
 	// 必填。
 	ParseRequest func(ctx context.Context, raw []byte) (key string, req any, err error)

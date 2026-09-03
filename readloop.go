@@ -21,7 +21,7 @@ type inboundFrame struct {
 
 // readLoop 是底层唯一 reader。
 //
-// 职责切分(详见 docs/wsmsg-flow.md §3):
+// 职责切分:
 //   - 读 wsConn → 帧类型准入 → 扔进 inbox channel
 //   - 维护 read deadline(配合 PongHandler)
 //   - 单向模式下首帧之后再收到业务帧 → 判协议违规并收敛连接
@@ -100,22 +100,22 @@ func (s *Session) admitInbound(ctx context.Context, msgType int, firstFrameRead 
 	switch msgType {
 	case websocket.TextMessage:
 		if firstFrameRead && s.handlers.OnMessage == nil {
-			s.closeWithError(ctx, CodeInvalidParam, ReasonUnexpectedFrame)
+			s.closeWithError(ctx, CodeInvalidParam, ReasonUnexpectedFrame, ErrUnexpectedFrame)
 			return ErrUnexpectedFrame
 		}
 		return nil
 	case websocket.BinaryMessage:
 		if s.handlers.OnBinaryMessage == nil {
-			s.closeWithError(ctx, CodeInvalidFrameType, ReasonBinaryFrameUnsupported)
+			s.closeWithError(ctx, CodeInvalidFrameType, ReasonBinaryFrameUnsupported, ErrInvalidFrame)
 			return ErrInvalidFrame
 		}
 		if !firstFrameRead {
-			s.closeWithError(ctx, CodeInvalidFrameType, ReasonBinaryFirstFrame)
+			s.closeWithError(ctx, CodeInvalidFrameType, ReasonBinaryFirstFrame, ErrInvalidFrame)
 			return ErrInvalidFrame
 		}
 		return nil
 	default:
-		s.closeWithError(ctx, CodeInvalidFrameType, ReasonBinaryFrameUnsupported)
+		s.closeWithError(ctx, CodeInvalidFrameType, ReasonBinaryFrameUnsupported, ErrInvalidFrame)
 		return ErrInvalidFrame
 	}
 }
@@ -131,8 +131,8 @@ func (s *Session) emitClientClose(ctx context.Context, err error) {
 	if s.serverClosing.Load() {
 		return
 	}
-	var closeErr *websocket.CloseError
-	if !errors.As(err, &closeErr) || closeErr.Code == websocket.CloseAbnormalClosure {
+	closeErr, ok := errors.AsType[*websocket.CloseError](err)
+	if !ok || closeErr.Code == websocket.CloseAbnormalClosure {
 		return
 	}
 	// Reason 是**客户端可控文本**:按与 error 帧同一上限截断,调用方落日志前

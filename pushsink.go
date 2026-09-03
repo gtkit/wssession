@@ -72,7 +72,7 @@ func NewBinaryFrame(data []byte) Frame {
 
 // Push 把 payload 序列化后塞进该连接的出站队列(实现 PushSink)。
 //
-// payload 为 Frame 时原样入队(不重复序列化);其它值用 gtkitjson 序列化为文本帧。
+// payload 为 Frame 或 *Frame 时原样入队(不重复序列化);其它值用 gtkitjson 序列化为文本帧。
 //
 // 并发安全,可与 Run / OnMessage 的推送并存(出帧由 writeLoop 串行写出,
 // 帧序由入队时刻决定)。返回 ErrSlowConsumer / ErrOutboundFrameTooLarge /
@@ -103,26 +103,37 @@ func (s *Session) TryPush(ctx context.Context, payload any) error {
 
 // outboundFor 把业务 payload 归一化为待发送帧。
 //
+// Frame 与 *Frame 都按预序列化帧原样入队——Frame 只有未导出字段,若漏掉指针形态,
+// *Frame 会落到 JSON 序列化被静默推成 "{}"。其它值用 gtkitjson 序列化为文本帧,
 // 序列化在业务 goroutine 侧完成(可并行),writeLoop 只做纯 IO。
 func (s *Session) outboundFor(payload any) (outboundMessage, error) {
-	if f, ok := payload.(Frame); ok {
-		if f.messageType == 0 {
-			return outboundMessage{}, fmt.Errorf("wssession: zero-value Frame is not pushable, create it with NewFrame or NewBinaryFrame: %w", ErrInvalidFrame)
+	var frame Frame
+	switch p := payload.(type) {
+	case Frame:
+		frame = p
+	case *Frame:
+		if p == nil {
+			return outboundMessage{}, fmt.Errorf("wssession: nil *Frame is not pushable: %w", ErrInvalidFrame)
 		}
-		if err := s.checkOutboundSize(len(f.data)); err != nil {
+		frame = *p
+	default:
+		data, err := gtkitjson.Marshal(payload)
+		if err != nil {
+			return outboundMessage{}, fmt.Errorf("wssession: marshal push payload: %w", err)
+		}
+		if err := s.checkOutboundSize(len(data)); err != nil {
 			return outboundMessage{}, err
 		}
-		return outboundMessage{messageType: f.messageType, data: f.data}, nil
+		return outboundMessage{messageType: websocket.TextMessage, data: data}, nil
 	}
 
-	data, err := gtkitjson.Marshal(payload)
-	if err != nil {
-		return outboundMessage{}, fmt.Errorf("wssession: marshal push payload: %w", err)
+	if frame.messageType == 0 {
+		return outboundMessage{}, fmt.Errorf("wssession: zero-value Frame is not pushable, create it with NewFrame or NewBinaryFrame: %w", ErrInvalidFrame)
 	}
-	if err := s.checkOutboundSize(len(data)); err != nil {
+	if err := s.checkOutboundSize(len(frame.data)); err != nil {
 		return outboundMessage{}, err
 	}
-	return outboundMessage{messageType: websocket.TextMessage, data: data}, nil
+	return outboundMessage{messageType: frame.messageType, data: frame.data}, nil
 }
 
 // checkOutboundSize 按 Options.MaxOutboundFrameBytes 校验单帧字节数(<=0 不限)。
@@ -138,8 +149,8 @@ func (s *Session) checkOutboundSize(size int) error {
 // (典型配合 sessionhub:遍历 Conns(userID) 逐个 Kick)。
 //
 // 幂等:与其它错误关闭路径共享同一幂等域,重复调用只下发首帧。
-// 被踢连接的 Serve 会以预期 close 错误返回,调用方照常忽略即可。
+// 踢下线是预期关闭,被踢连接的 Serve 返回 nil,不作为错误上抛。
 // 客户端契约:收到 error(409) 应提示被顶下线且不自动重连。
 func (s *Session) Kick(ctx context.Context, reason string) {
-	s.closeWithError(ctx, CodeConflict, reason)
+	s.closeWithError(ctx, CodeConflict, reason, nil)
 }

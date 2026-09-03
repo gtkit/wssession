@@ -14,8 +14,6 @@
 //   - outbound.go     outboundMessage + queue 反压
 //   - connlimit.go    IP/key 维度连接 cap(分片 mutex 计数表,归零删除 key)
 //   - origin.go       Origin 白名单
-//
-// 完整流程文档见 docs/wsmsg-flow.md。
 package wssession
 
 import (
@@ -128,7 +126,7 @@ type Options struct {
 	AllowedOrigins []string
 
 	// ConfigureUpgrader 可选的握手期逃生阀:在桥接层设完自身默认值(缓冲区、
-	// 共享写缓冲池、按 AllowedOrigins 构造的 CheckOrigin)之后、执行 Upgrade 之前
+	// 共享写缓冲池、10s 握手超时、按 AllowedOrigins 构造的 CheckOrigin)之后、执行 Upgrade 之前
 	// 调用一次,用于设置 gorilla 原生字段——Subprotocols(子协议协商)、
 	// EnableCompression(permessage-deflate)、HandshakeTimeout、缓冲区大小等。
 	//
@@ -195,7 +193,8 @@ type Options struct {
 	// OutboundBufferSize outbox channel 容量。默认 128。
 	OutboundBufferSize int
 
-	// MaxOutboundFrameBytes 单条业务出站文本帧序列化后的最大字节数。
+	// MaxOutboundFrameBytes 单条业务出站帧的最大字节数:文本帧按序列化后的字节数、
+	// 二进制帧(NewBinaryFrame)按原始字节数计。
 	// <=0(默认)=不限制。超限时 Push 返回 ErrOutboundFrameTooLarge,且不入队该帧。
 	MaxOutboundFrameBytes int
 
@@ -222,14 +221,14 @@ type Options struct {
 	//     X-Forwarded-For 客户端可任意伪造,默认信任会导致 IP 维度 connCap
 	//     被绕过,并放大连接计数表的 key 膨胀,故默认不信任。
 	//   - n>0:从 X-Forwarded-For 列表**由右向左**数第 n 跳取客户端 IP
-	//     (可信代理把上游地址追加在列表右侧);n 超过列表长度时回退到列表
-	//     最左端,列表为空时回退 RemoteAddr。
+	//     (可信代理把上游地址追加在列表右侧);列表条目数少于 n(请求没有经过
+	//     完整的可信链)或列表为空时回退 RemoteAddr,不取客户端可控的最左端。
 	//
 	// 部署在 Nginx / 网关等反向代理后时,应设为可信代理的跳数。
 	TrustedProxyCount int
 
 	// InboundRatePerSecond 双向模式下单连接入站业务消息的速率上限(条/秒)。
-	// 0(默认)= 不限速。仅在 Handlers.OnMessage 非 nil 时生效。
+	// 0(默认)= 不限速。仅在双向模式(OnMessage / OnBinaryMessage 至少一个非 nil)生效。
 	InboundRatePerSecond float64
 
 	// InboundRateBurst 双向模式下入站消息的突发额度(令牌桶容量)。
@@ -254,7 +253,7 @@ type Options struct {
 	// OnEvent 可选的生命周期事件回调,用于接入调用方自己的日志 / metrics。
 	//
 	// 上报时机:panic / 慢消费者 / 连接 cap 拒绝 / 1006 异常断开 /
-	// 入站限速 / turn 打断 / turn 卡住(见 EventType)。
+	// 入站限速 / turn 打断 / turn 卡住 / 客户端 close 帧(见 EventType)。
 	// nil 时桥接层跳过上报。事件的记录方式由调用方决定。
 	//
 	// 回调必须**快且非阻塞**(同步调用,会短暂参与连接收敛路径),且必须

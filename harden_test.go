@@ -74,7 +74,8 @@ func TestClientIP(t *testing.T) {
 		{"one trusted hop single entry", "10.0.0.1:1234", "1.2.3.4", 1, "1.2.3.4"},
 		{"one trusted hop picks rightmost", "10.0.0.1:1234", "client, proxyA", 1, "proxyA"},
 		{"two trusted hops picks client", "10.0.0.1:1234", "client, proxyA", 2, "client"},
-		{"hops exceed list falls left", "10.0.0.1:1234", "client, proxyA", 9, "client"},
+		{"hops exceed list falls back to remote", "10.0.0.1:1234", "client, proxyA", 9, "10.0.0.1"},
+		{"spoofed single entry with two trusted hops falls back to remote", "10.0.0.1:1234", "6.6.6.6", 2, "10.0.0.1"},
 		{"trusted but empty xff falls remote", "10.0.0.1:1234", "", 1, "10.0.0.1"},
 		{"trims spaces", "10.0.0.1:1234", "  9.9.9.9  ", 1, "9.9.9.9"},
 	}
@@ -159,8 +160,8 @@ func TestCloseWithErrorIdempotent(t *testing.T) {
 		}
 	}()
 
-	s.closeWithError(t.Context(), CodeTooManyConn, "first")
-	s.closeWithError(t.Context(), CodeInternal, "second")
+	s.closeWithError(t.Context(), CodeTooManyConn, "first", nil)
+	s.closeWithError(t.Context(), CodeInternal, "second", nil)
 
 	got := 0
 	var firstReason string

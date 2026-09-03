@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 
@@ -186,11 +187,19 @@ func TestReadLimitExceeded(t *testing.T) {
 	big := strings.Repeat("a", 200)
 	_ = conn.WriteMessage(websocket.TextMessage, []byte(big))
 
-	// 服务端应 close 连接(gorilla 客户端读会返回错误)
+	// 契约(README"唯一例外"):超限只有 close 1009,没有 error JSON 帧。
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, _, err := conn.ReadMessage()
-	if err == nil {
-		t.Fatal("expected read error after server closes oversized frame")
+	for {
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			if !websocket.IsCloseError(err, websocket.CloseMessageTooBig) {
+				t.Fatalf("err = %v, want close 1009", err)
+			}
+			return
+		}
+		if mt == websocket.TextMessage {
+			t.Fatalf("ReadLimit 超限不应下发 error 帧,却收到 %s", data)
+		}
 	}
 }
 
@@ -363,6 +372,51 @@ func TestQueueCtxCancelDuringWait(t *testing.T) {
 	}
 }
 
+// TestDrainOutboxReleasesWaiters:writeLoop 退出路径上的 drain 对每个滞留帧兑现 done,
+// closeWithError / closeNormal 的等待方立即解除阻塞,而不是等满 1s 兜底。
+func TestDrainOutboxReleasesWaiters(t *testing.T) {
+	t.Parallel()
+	s := &Session{outbox: make(chan outboundMessage, 4)}
+	done1, done2 := make(chan struct{}), make(chan struct{})
+	s.outbox <- outboundMessage{messageType: websocket.CloseMessage, done: done1}
+	s.outbox <- outboundMessage{messageType: websocket.TextMessage} // 无 done 的业务帧
+	s.outbox <- outboundMessage{messageType: websocket.CloseMessage, done: done2}
+
+	s.drainOutbox()
+
+	for i, done := range []chan struct{}{done1, done2} {
+		select {
+		case <-done:
+		default:
+			t.Fatalf("滞留帧 #%d 的 done 未被兑现", i+1)
+		}
+	}
+	if n := len(s.outbox); n != 0 {
+		t.Fatalf("drain 后 outbox 仍有 %d 帧", n)
+	}
+}
+
+// TestTruncateErrorReasonKeepsRuneBoundary:reason 截断回退到 rune 边界,不产生非法 UTF-8。
+func TestTruncateErrorReasonKeepsRuneBoundary(t *testing.T) {
+	t.Parallel()
+	ascii := strings.Repeat("x", maxErrorReasonLen+7)
+	if got := truncateErrorReason(ascii); len(got) != maxErrorReasonLen {
+		t.Fatalf("ASCII 截断长度 = %d, want %d", len(got), maxErrorReasonLen)
+	}
+	// 每个汉字 3 字节,256 不是 3 的倍数,按字节硬切必然切在字中间。
+	han := strings.Repeat("参", maxErrorReasonLen)
+	got := truncateErrorReason(han)
+	if !utf8.ValidString(got) {
+		t.Fatalf("截断结果不是合法 UTF-8: %q", got)
+	}
+	if len(got) > maxErrorReasonLen || len(got) <= maxErrorReasonLen-utf8.UTFMax {
+		t.Fatalf("截断长度 = %d, want (%d, %d]", len(got), maxErrorReasonLen-utf8.UTFMax, maxErrorReasonLen)
+	}
+	if short := "短文案"; truncateErrorReason(short) != short {
+		t.Fatal("未超限的 reason 不应被改动")
+	}
+}
+
 func TestCloseWithErrorUsesShortQueueTimeout(t *testing.T) {
 	t.Parallel()
 	s := &Session{
@@ -373,7 +427,7 @@ func TestCloseWithErrorUsesShortQueueTimeout(t *testing.T) {
 	}
 
 	start := time.Now()
-	s.closeWithError(t.Context(), CodeTooManyConn, "slow consumer")
+	s.closeWithError(t.Context(), CodeTooManyConn, "slow consumer", nil)
 	elapsed := time.Since(start)
 
 	if elapsed > time.Second {
@@ -400,7 +454,7 @@ func TestCloseWithErrorTruncatesLongReason(t *testing.T) {
 		close(closeMsg.done)
 	}()
 
-	s.closeWithError(t.Context(), CodeInvalidParam, strings.Repeat("x", maxErrorReasonLen+32))
+	s.closeWithError(t.Context(), CodeInvalidParam, strings.Repeat("x", maxErrorReasonLen+32), nil)
 
 	select {
 	case frame := <-captured:
@@ -705,15 +759,13 @@ func TestConcurrentSessionsCounterBalances(t *testing.T) {
 	const N = 20
 	var wg sync.WaitGroup
 	for i := range N {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
+		wg.Go(func() {
 			conn, _ := dial(t, wsURL(srv.URL, path))
 			payload := fmt.Sprintf(`{"action":"subscribe","token":"tok-%d"}`, i)
 			_ = conn.WriteMessage(websocket.TextMessage, []byte(payload))
 			_ = readJSONFrame(t, conn, 2*time.Second)
 			_ = conn.Close()
-		}(i)
+		})
 	}
 	wg.Wait()
 

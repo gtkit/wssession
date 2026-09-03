@@ -3,6 +3,7 @@ package wssession
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -106,6 +107,68 @@ func TestPushZeroValueFrameRejected(t *testing.T) {
 	}
 }
 
+// TestPushPointerFrameNotReserialized:传 *Frame 与传 Frame 等价——原样入队而不是
+// 落到 JSON 序列化被静默推成 "{}";nil *Frame 与零值 *Frame 同样被拒。
+func TestPushPointerFrameNotReserialized(t *testing.T) {
+	t.Parallel()
+	f, err := NewFrame(map[string]any{"event": "notice"})
+	if err != nil {
+		t.Fatalf("NewFrame error = %v", err)
+	}
+	s := newOutboxSession(1, Options{})
+
+	if err := s.Push(t.Context(), &f); err != nil {
+		t.Fatalf("Push *Frame error = %v", err)
+	}
+	msg := <-s.outbox
+	if string(msg.data) != string(f.data) || &msg.data[0] != &f.data[0] {
+		t.Fatalf("*Frame 未原样入队: %s", msg.data)
+	}
+
+	var nilFrame *Frame
+	if err := s.Push(t.Context(), nilFrame); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("Push nil *Frame error = %v, want ErrInvalidFrame", err)
+	}
+	if err := s.Push(t.Context(), &Frame{}); !errors.Is(err, ErrInvalidFrame) {
+		t.Fatalf("Push 零值 *Frame error = %v, want ErrInvalidFrame", err)
+	}
+}
+
+// TestPushConcurrentSameFrame:同一个 Frame 被多个 goroutine 并发推给同一连接——
+// Frame 并发可复用、Push 并发安全,-race 下无竞态且每帧字节完整。
+func TestPushConcurrentSameFrame(t *testing.T) {
+	t.Parallel()
+	f, err := NewFrame(map[string]any{"event": "tick"})
+	if err != nil {
+		t.Fatalf("NewFrame error = %v", err)
+	}
+	const goroutines, perGoroutine = 8, 50
+	s := newOutboxSession(goroutines*perGoroutine, Options{})
+
+	var wg sync.WaitGroup
+	for range goroutines {
+		wg.Go(func() {
+			for range perGoroutine {
+				if err := s.Push(t.Context(), f); err != nil {
+					t.Errorf("并发 Push error = %v", err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+
+	if got := len(s.outbox); got != goroutines*perGoroutine {
+		t.Fatalf("入队帧数 = %d, want %d", got, goroutines*perGoroutine)
+	}
+	want := string(f.data)
+	for range goroutines * perGoroutine {
+		if got := string((<-s.outbox).data); got != want {
+			t.Fatalf("帧字节被破坏: %s", got)
+		}
+	}
+}
+
 // TestPushFrameRespectsMaxOutboundFrameBytes:连接级出站上限对 Frame 同样生效。
 func TestPushFrameRespectsMaxOutboundFrameBytes(t *testing.T) {
 	t.Parallel()
@@ -191,8 +254,7 @@ func benchFanOut(b *testing.B, useFrame bool) {
 	ctx := b.Context()
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		var frame Frame
 		if useFrame {
 			var err error

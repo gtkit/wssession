@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 	"golang.org/x/sync/errgroup"
@@ -78,6 +79,13 @@ type Session struct {
 	// errFrameOnce 保证并发错误关闭时只下发首个 error 帧。
 	errFrameOnce sync.Once
 
+	// termErr 记录首个服务端主动错误关闭的根因,在 errFrameOnce 的 Once 内写入,
+	// 与下发的 error 帧对应同一次关闭。Serve 在 errgroup 收敛后优先返回它:
+	// 主动关闭底层连接会同时唤醒 readLoop 返回 net.ErrClosed,哪个 loop 先把 error
+	// 交给 errgroup 取决于调度,不能拿 errgroup 的首个 error 当"连接为何结束"的依据。
+	// 用 atomic.Pointer:写入方可能是 Kick 调用方、首帧定时器等 errgroup 之外的 goroutine。
+	termErr atomic.Pointer[error]
+
 	closeOnce sync.Once
 }
 
@@ -87,13 +95,17 @@ const errorFrameQueueOfferTimeout = 500 * time.Millisecond
 // 客户端假死时最多延迟这么久再裸关,不阻碍连接关闭。
 const closeFrameWriteTimeout = time.Second
 
+// handshakeTimeout 是 Upgrade 阶段写出 101 响应的超时兜底(gorilla Upgrader.HandshakeTimeout),
+// 调用方可经 Options.ConfigureUpgrader 覆盖。
+const handshakeTimeout = 10 * time.Second
+
 // wsWriteBufferPool 供所有连接共享写缓冲(gorilla 仅在写帧瞬间占用),
 // 避免每连接常驻 4KB 写缓冲。
 var wsWriteBufferPool = &sync.Pool{}
 
-// Serve 完成一个 wsmsg 连接的完整托管流程。
+// Serve 完成一个 WebSocket 连接的完整托管流程。
 //
-// 流程(详见 docs/wsmsg-flow.md §1):
+// 流程:
 //
 //	⓪ 停机准入(parent ctx 已取消 → HTTP 503,不 Upgrade)
 //	① IP 维度 connCap(Upgrade 之前;失败 HTTP 429,不 Upgrade)
@@ -104,8 +116,11 @@ var wsWriteBufferPool = &sync.Pool{}
 //	⑥ 等所有 goroutine 收敛 + 释放资源
 //
 // 返回值:
-//   - nil          : 正常关闭(Run 自然 return / 客户端 close / ctx 超时)
-//   - non-nil err  : 任一 goroutine 异常 / 停机期拒连 / IP cap 满 / Upgrade 失败 / OnConnect err
+//   - nil          : 预期关闭——Run 自然 return / 客户端 close / 会话超时或上游取消 / Kick
+//   - non-nil err  : 服务端主动错误关闭的根因(首帧超时 / ParseRequest 错误 / token cap 满 /
+//     业务回调返回的非预期错误或 panic / 帧准入拒绝),以及停机期拒连 / IP cap 满 /
+//     Upgrade 失败 / OnConnect err / loop panic。主动错误关闭的根因记录在 Session.termErr,
+//     由 Serve 确定性返回,不依赖 errgroup 收到各 loop error 的先后。
 func Serve(parent context.Context, w http.ResponseWriter, r *http.Request, options Options, handlers Handlers) error {
 	if err := handlers.validate(); err != nil {
 		return err
@@ -139,17 +154,18 @@ func Serve(parent context.Context, w http.ResponseWriter, r *http.Request, optio
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
 			_, _ = w.Write([]byte(`{"code":429,"msg":"` + ReasonTooManyIPConn + `","data":null}`))
-			return errors.New("wssession: ip connCap exceeded")
+			return fmt.Errorf("%w: ip dimension", ErrConnCapExceeded)
 		}
 		defer release(ipCapKey)
 	}
 
 	// ② HTTP Upgrade(Origin 校验在 CheckOrigin 内)
 	upgrader := websocket.Upgrader{
-		ReadBufferSize:  4096,
-		WriteBufferSize: 4096,
-		WriteBufferPool: wsWriteBufferPool,
-		CheckOrigin:     newOriginChecker(opts.AllowedOrigins),
+		HandshakeTimeout: handshakeTimeout,
+		ReadBufferSize:   4096,
+		WriteBufferSize:  4096,
+		WriteBufferPool:  wsWriteBufferPool,
+		CheckOrigin:      newOriginChecker(opts.AllowedOrigins),
 	}
 	// 逃生阀:调用方可设 Subprotocols / EnableCompression / HandshakeTimeout 等
 	// gorilla 原生字段(也可覆盖 CheckOrigin,此时 Origin 责任转移给调用方)。
@@ -158,8 +174,8 @@ func Serve(parent context.Context, w http.ResponseWriter, r *http.Request, optio
 	}
 	wsConn, err := upgrader.Upgrade(w, r, opts.ResponseHeader)
 	if err != nil {
-		// gorilla 已写 HTTP 4xx,直接 return
-		return err
+		// gorilla 已写 HTTP 4xx,包装后上抛
+		return fmt.Errorf("wssession: upgrade: %w", err)
 	}
 
 	sess := &Session{
@@ -213,6 +229,12 @@ func Serve(parent context.Context, w http.ResponseWriter, r *http.Request, optio
 
 	// ⑥ 等所有 goroutine 收敛
 	waitErr := group.Wait()
+
+	// 服务端主动错误关闭:根因已在 closeWithError 内记录,优先返回它——
+	// 主动关闭会同时唤醒 readLoop 返回 net.ErrClosed,errgroup 的首个 error 不可靠。
+	if p := sess.termErr.Load(); p != nil {
+		return *p
+	}
 	if waitErr == nil {
 		return nil
 	}
@@ -234,6 +256,10 @@ func Serve(parent context.Context, w http.ResponseWriter, r *http.Request, optio
 //
 // 在 Serve defer、ctx.Done 监听 goroutine、closeNormal / closeWithError 内
 // 均会调用,sync.Once 保证只关一次。
+//
+// 持有 *Session 的调用方直接调用时注意语义:未发过 close 帧的连接会以 1001
+// GoingAway 完成握手,按客户端重连决策表这表示"请退避重连"。要拒绝或踢掉一个
+// 连接应使用 Kick(error 409 + close 1008,客户端不重连),而不是 Close。
 //
 // 兜底握手:若此前已通过 outbox 写出过 close 帧(Run 正常结束的 1000 /
 // 错误关闭的 1008/1011),gorilla 对重复 close 帧返回 ErrCloseSent、不上写,
@@ -363,10 +389,17 @@ func (s *Session) IsClosed() bool {
 // 同步等待是关键:若立即 close,writeLoop 会因 wsConn 关闭而 WriteMessage 失败,
 // error 帧丢失,客户端只看到 abnormal closure 而无错误码/原因。
 //
+// cause 是本次关闭的根因:非 nil 时记入 termErr 并由 Serve 返回;nil 表示该关闭
+// 不作为 Serve 的错误上抛(Kick、已由 EventTurnStuck 上报的失约轮次)。
+//
 // 调用方应在调用本方法后 return,让所在的 loop 退出 → errgroup 收敛 → defer Close。
-func (s *Session) closeWithError(ctx context.Context, code int, reason string) {
-	// 幂等:并发触发只下发首个 error 帧,避免客户端收到矛盾的错误码。
+func (s *Session) closeWithError(ctx context.Context, code int, reason string, cause error) {
+	// 幂等:并发触发只下发首个 error 帧,避免客户端收到矛盾的错误码;
+	// termErr 在同一个 Once 内决定,与下发的 error 帧始终对应同一次关闭。
 	s.errFrameOnce.Do(func() {
+		if cause != nil {
+			s.termErr.Store(&cause)
+		}
 		frame := errorFrame{
 			Event:     "error",
 			Code:      code,
@@ -425,11 +458,17 @@ func wsCloseCode(code int) int {
 	return websocket.ClosePolicyViolation
 }
 
+// truncateErrorReason 把 reason 截到 maxErrorReasonLen 字节以内,并回退到 rune 边界,
+// 不把多字节字符切成非法 UTF-8。
 func truncateErrorReason(reason string) string {
 	if len(reason) <= maxErrorReasonLen {
 		return reason
 	}
-	return reason[:maxErrorReasonLen]
+	cut := maxErrorReasonLen
+	for cut > 0 && !utf8.RuneStart(reason[cut]) {
+		cut--
+	}
+	return reason[:cut]
 }
 
 // IsExpectedClose 用于识别浏览器主动断开 / 正常 EOF / errgroup 内部 cancel 触发的 close,
@@ -470,7 +509,9 @@ func isAbnormalClose(err error) bool {
 //
 // trustedProxyCount<=0 时只用传输层 RemoteAddr,忽略客户端可伪造的
 // X-Forwarded-For;>0 时从 X-Forwarded-For 列表由右向左取第 trustedProxyCount
-// 跳(可信代理把上游地址追加在右侧),越界回退到列表最左端或 RemoteAddr。
+// 跳(可信代理把上游地址追加在右侧)。列表条目数少于 trustedProxyCount 说明请求
+// 没有经过完整的可信链,列表里没有任何一跳能确认是可信代理写入的,一律退回
+// RemoteAddr(fail-closed),不取客户端可控的最左端。
 func clientIP(r *http.Request, trustedProxyCount int) string {
 	remote := remoteHost(r)
 	if trustedProxyCount <= 0 {
@@ -483,8 +524,10 @@ func clientIP(r *http.Request, trustedProxyCount int) string {
 	}
 
 	parts := strings.Split(xff, ",")
-	idx := max(len(parts)-trustedProxyCount, 0)
-	if ip := strings.TrimSpace(parts[idx]); ip != "" {
+	if len(parts) < trustedProxyCount {
+		return remote
+	}
+	if ip := strings.TrimSpace(parts[len(parts)-trustedProxyCount]); ip != "" {
 		return ip
 	}
 	return remote
