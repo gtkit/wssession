@@ -16,7 +16,7 @@
 go get github.com/gtkit/wssession
 ```
 
-要求 Go 1.26+。
+要求 Go 1.27+。
 
 ---
 
