@@ -34,7 +34,7 @@ go get github.com/gtkit/wssession
 
 ## wssession
 
-通用 WebSocket 桥接层。业务通过 `Handlers{ParseRequest, Run, OnConnect}` 函数式注入，
+通用 WebSocket 桥接层。业务通过 `Handlers{ParseRequest, Run, OnConnect, OnMessage, OnBinaryMessage}` 函数式注入，
 通过 `PushSink` 推帧；`Options` 控制心跳、超时、缓冲、连接 cap、Origin 白名单。
 
 ### 引用
@@ -299,7 +299,8 @@ func handleChat(c *gin.Context) {
 	_ = wssession.Serve(c.Request.Context(), c.Writer, c.Request,
 		wssession.Options{
 			FirstFrameTimeout:    10 * time.Second,
-			InboundRatePerSecond: 2, // 单连接每秒最多 2 条用户消息（防刷）
+			ReadLimit:            64 << 10, // 默认 4096 字节对长 prompt 偏小；超限会以 close 1009 断连
+			InboundRatePerSecond: 2,        // 单连接每秒最多 2 条用户消息（防刷）
 			InboundRateBurst:     3,
 		},
 		wssession.Handlers{
@@ -436,7 +437,7 @@ _ = wssession.Serve(ctx, w, r, wssession.Options{},
 错误码：`408` 首帧超时、`409` 被顶下线（`Session.Kick`，客户端**不应**自动重连）、
 `415` 帧类型不被接受（二进制帧未启用 / 首帧不是文本帧）、
 `422` 解析失败或协议违规、`429` 连接超限/慢消费/入站限速、`500` 内部错误
-（常量见 `wssession/errors.go`：`CodeFirstFrameTimeout` / `CodeConflict` / `CodeInvalidParam` / `CodeTooManyConn` 等）。
+（常量见 `errors.go`：`CodeFirstFrameTimeout` / `CodeConflict` / `CodeInvalidParam` / `CodeTooManyConn` 等）。
 
 **关闭语义（WebSocket close 握手）**：服务端主动关闭一律先完成 close 握手再断开——
 `Run` 正常结束（返回 nil）→ flush 完在途帧后发 close `1000`；错误关闭 → 先发上表的 `error` JSON 帧，
@@ -521,6 +522,8 @@ _ = wssession.Serve(ctx, w, r,
 | `ClientIP() string` | 按 `TrustedProxyCount` 解析的客户端 IP | 审计日志（与 IP cap key 同口径） |
 | `IsClosed() bool` | 连接是否已关闭 | 注册表推送前过滤已收敛连接 |
 
+> `Close()` 也是导出方法：幂等关闭连接，未发过 close 帧时以 **1001 GoingAway** 完成握手——按上文重连决策表，客户端收到 1001 会**退避重连**。要拒绝或踢掉一个连接用 `Kick`（409 + close 1008，客户端不重连）；`Close()` 只适合"这条连接该换个实例重连"的场景。
+
 `Value()` 解决的是"消息回调拿不到会话对象"：`OnMessage` / `OnBinaryMessage` 的签名只有 `(ctx, raw, sink)`，而「关键约束」又要求闭包不得捕获可变状态。持有 `*Session` 即可跨轮次取到 `req`：
 
 ```go
@@ -548,14 +551,14 @@ _ = wssession.Serve(ctx, w, r, opts, wssession.Handlers{
 
 IP 维度连接 cap 使用的客户端 IP 默认取自传输层 `RemoteAddr`，**忽略客户端可伪造的 `X-Forwarded-For`**。
 部署在反向代理（Nginx / 网关）后时，把 `Options.TrustedProxyCount` 设为可信代理跳数，
-`wssession` 会从 `X-Forwarded-For` 列表**由右向左**取第 N 跳作为客户端 IP。未配置（0）时，
+`wssession` 会从 `X-Forwarded-For` 列表**由右向左**取第 N 跳作为客户端 IP；列表条目数少于 N（请求没有经过完整的可信链）时**退回 `RemoteAddr`**，不取客户端可控的最左端。未配置（0）时，
 所有请求按真实 `RemoteAddr` 计入 cap，伪造 XFF 无法绕过上限。
 
 > loop goroutine 内发生 panic 会被恢复并转为 error 经 `Serve` 返回值上抛（不会让进程崩溃，也不会被静默吞没）。
 
 ### 握手定制（子协议 / 压缩 / 响应头）
 
-握手期的 gorilla `Upgrader` 默认由桥接层配置（缓冲区、共享写缓冲池、按 `AllowedOrigins` 构造的 `CheckOrigin`）。需要更多控制时用 `Options.ConfigureUpgrader` 逃生阀——它在桥接层设完默认值之后、Upgrade 之前被调用一次：
+握手期的 gorilla `Upgrader` 默认由桥接层配置（缓冲区、共享写缓冲池、10s 握手超时、按 `AllowedOrigins` 构造的 `CheckOrigin`）。需要更多控制时用 `Options.ConfigureUpgrader` 逃生阀——它在桥接层设完默认值之后、Upgrade 之前被调用一次：
 
 ```go
 _ = wssession.Serve(ctx, w, r, wssession.Options{
@@ -726,6 +729,8 @@ for _, uid := range hub.Users() {
 
 - `ParseRequest` 必填；`Run` / `OnMessage` / `OnBinaryMessage` 三者至少一个，`OnConnect` 可选；
   缺必填字段时 `Serve` 返回 `ErrHandlersIncomplete`。
+- **`ParseRequest` 返回的 `err.Error()` 会作为 `error(422)` 帧的 reason 原样下发给客户端**（按 256 字节截断）：只返回适合客户端看到的文案，不要把内部错误包装进去。
+- **`Serve` 的返回值**：服务端主动错误关闭的根因——首帧超时（`ErrFirstFrameTimeout`）、`ParseRequest` 错误、token 维度连接 cap（`ErrConnCapExceeded`）、`Run` / `OnMessage` / `OnBinaryMessage` 返回的非预期错误或 panic、帧准入拒绝（`ErrInvalidFrame` / `ErrUnexpectedFrame`）——确定性地从 `Serve` 返回；`Kick`、客户端主动关闭、会话超时、上游取消返回 nil。
 - `Run` 是 blocking 调用，跑在独立 processLoop；**不要**在 `Run` 内 spawn goroutine 后立即 return
   （否则会被当作业务已结束）。需异步处理就在 `Run` 内自己用 errgroup 编排后再 return。
 - 单向模式下 `Run` 返回 nil 即视为业务结束：`wssession` 会 flush 完在途帧、下发 close(1000) 并主动关闭连接。
