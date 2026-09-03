@@ -35,8 +35,8 @@ func newTestSession(t *testing.T, path string, opts Options, handlers Handlers) 
 	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
 		_ = Serve(r.Context(), w, r, opts, handlers)
 	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
+	srv := httptest.NewTestServer(t, mux) // 自动 Cleanup;handler panic 直接判 fail
+	srv.Start()                           // gorilla 客户端走真实 TCP,需要 loopback 监听而非默认内存网络
 	return srv
 }
 

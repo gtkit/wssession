@@ -388,8 +388,8 @@ func TestInterruptStuckTurnReportedOnce(t *testing.T) {
 		default:
 		}
 	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
+	srv := httptest.NewTestServer(t, mux) // 自动 Cleanup;handler panic 直接判 fail
+	srv.Start()                           // gorilla 客户端走真实 TCP,需要 loopback 监听而非默认内存网络
 
 	conn, _ := dial(t, wsURL(srv.URL, path))
 	subscribe(t, conn)

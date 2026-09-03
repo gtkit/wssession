@@ -49,8 +49,8 @@ func TestSingleSignOnKickEndToEnd(t *testing.T) {
 			release()
 		}
 	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
+	srv := httptest.NewTestServer(t, mux) // 自动 Cleanup;handler panic 直接判 fail
+	srv.Start()                           // gorilla 客户端走真实 TCP,需要 loopback 监听而非默认内存网络
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws"
 
 	subscribe := func(t *testing.T) *websocket.Conn {
